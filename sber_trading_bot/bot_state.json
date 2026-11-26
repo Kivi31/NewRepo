@@ -1,7 +1,8 @@
 {
   "date": "2026-11-26",
   "position": null,
-  "last_candle": 1795689600,
+  "last_candle": 1795707300,
   "daily_loss": 0.0,
-  "trades": 0
+  "trades": 0,
+  "pending_order": null
 }

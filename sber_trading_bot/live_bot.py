@@ -10,12 +10,14 @@ from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
 from dotenv import load_dotenv
-from config import config
 
 from strategy import generate_signal
 
 
-# ---------- НАСТРОЙКИ ----------
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
 load_dotenv(Path(__file__).with_name(".env"))
 
 EMAIL = os.getenv("CASSANDRA_EMAIL")
@@ -25,70 +27,146 @@ LOGIN_URL = "https://cassandra.lite-invest.com"
 API_URL = "https://api-cassandra.lite-invest.com"
 
 ACCOUNT = "00445"
-SECURITY = "SBER@TQBR"
-LOT_SIZE = 1
+
+# Все инструменты, которые отслеживает бот
+SECURITIES = [
+    "SBER@TQBR",
+    "GAZP@TQBR",
+    "LKOH@TQBR",
+    "YDEX@TQBR",
+    "T@TQBR",
+    "VTBR@TQBR",
+    "CHMF@TQBR",
+    "NVTK@TQBR",
+    "GMKN@TQBR",
+    "ROSN@TQBR",
+]
+
+# Количество акций в одном лоте.
+# Перед реальной торговлей проверь значения в карточке
+# каждого инструмента у своего брокера.
+SHARES_PER_LOT = {
+    "SBER@TQBR": 1,
+    "GAZP@TQBR": 10,
+    "LKOH@TQBR": 1,
+    "YDEX@TQBR": 1,
+    "T@TQBR": 1,
+    "VTBR@TQBR": 1,
+    "CHMF@TQBR": 1,
+    "NVTK@TQBR": 1,
+    "GMKN@TQBR": 10,
+    "ROSN@TQBR": 1,
+}
+
+# Количество лотов на одну сделку по каждому инструменту.
+# Пока установлено по 1 лоту.
+LOT_SIZE = {
+    security: 1
+    for security in SECURITIES
+}
 
 TIMEFRAME = 300
 POLL_SECONDS = 10
+CANDLE_REFRESH_SECONDS = 30
 
 STOP_LOSS = 0.015
 TAKE_PROFIT = 0.03
+
+# Общие ограничения для всего портфеля
 DAILY_LOSS_LIMIT = 100
 MAX_TRADES_PER_DAY = 5
 
+# Максимум одновременно открытых инструментов
+MAX_OPEN_POSITIONS = 5
+
+MAX_CANDLE_AGE = TIMEFRAME * 2 + 120
+
+REQUEST_TIMEOUT = (15, 45)
+
+RECONNECT_DELAYS = [5, 10, 20, 30, 60]
+
 TZ = ZoneInfo("Europe/Moscow")
+
 STATE_FILE = Path(__file__).with_name("bot_state.json")
+LOG_FILE = Path(__file__).with_name("bot.log")
+
+
+# ============================================================
+# ЛОГИРОВАНИЕ
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
 
-log = logging.getLogger("SBER-BOT")
+log = logging.getLogger("MULTI-SBER-BOT")
 
 
-# ---------- CASSANDRA API ----------
+# ============================================================
+# ИСКЛЮЧЕНИЯ
+# ============================================================
+
+class OrderOutcomeUnknown(Exception):
+    pass
+
+
+class PositionSyncError(Exception):
+    pass
+
+
+# ============================================================
+# CASSANDRA API
+# ============================================================
+
 class Cassandra:
 
     def __init__(self):
+
         self.session = requests.Session()
+
         self.access_token = None
         self.refresh_token = None
 
-        # Кэш исторических свечей
-        self._candles_cache = {}
-        self._candles_loaded = False
-        self._last_candles_refresh = 0
+        # Отдельный кэш для каждого инструмента
+        self.candles_cache = {}
+
+        self.candles_loaded = set()
+        self.last_candles_refresh = {}
+
+    # --------------------------------------------------------
+    # Авторизация
+    # --------------------------------------------------------
 
     def login(self):
+
         if not EMAIL or not PASSWORD:
             raise RuntimeError(
-                "В .env не заполнены CASSANDRA_EMAIL и CASSANDRA_PASSWORD"
+                "В .env не заполнены CASSANDRA_EMAIL "
+                "и CASSANDRA_PASSWORD"
             )
 
-        r = self.session.post(
+        response = self.session.post(
             LOGIN_URL + "/api/Authentication/Login",
             json={
                 "email": EMAIL,
                 "password": PASSWORD
             },
-            timeout=60
+            timeout=REQUEST_TIMEOUT
         )
 
-        if not r.ok:
-            log.error(
-                "Cassandra HTTP %s: %s",
-                r.status_code,
-                r.text[:1500]
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("accessToken"):
+            raise RuntimeError(
+                "Cassandra не вернула accessToken"
             )
-
-        r.raise_for_status()
-
-        data = r.json()
 
         self.access_token = data["accessToken"]
         self.refresh_token = data.get("refreshToken")
@@ -100,27 +178,37 @@ class Cassandra:
 
         log.info("Авторизация Cassandra успешна")
 
-    def refresh(self):
-        if not self.refresh_token:
-            self.login()
-            return
+    # --------------------------------------------------------
+    # Обновление токена
+    # --------------------------------------------------------
 
-        r = self.session.post(
+    def refresh(self):
+
+        if not self.refresh_token:
+            raise RuntimeError(
+                "Отсутствует refreshToken"
+            )
+
+        response = self.session.post(
             LOGIN_URL + "/api/Authentication/Refresh",
             json={
                 "refreshToken": self.refresh_token,
                 "accessToken": self.access_token
             },
-            timeout=60
+            timeout=REQUEST_TIMEOUT
         )
 
-        if r.status_code != 200:
-            self.login()
-            return
+        response.raise_for_status()
 
-        data = r.json()
+        data = response.json()
+
+        if not data.get("accessToken"):
+            raise RuntimeError(
+                "Не удалось получить новый accessToken"
+            )
 
         self.access_token = data["accessToken"]
+
         self.refresh_token = data.get(
             "refreshToken",
             self.refresh_token
@@ -130,48 +218,77 @@ class Cassandra:
             f"Bearer {self.access_token}"
         )
 
-        log.info("Токен обновлён")
+        log.info("Токен Cassandra обновлён")
+
+    # --------------------------------------------------------
+    # Универсальный запрос
+    # --------------------------------------------------------
 
     def request(self, method, path, **kwargs):
+
         url = API_URL + path
 
-        for attempt in range(2):
-            r = self.session.request(
+        response = self.session.request(
+            method,
+            url,
+            timeout=REQUEST_TIMEOUT,
+            **kwargs
+        )
+
+        if response.status_code == 401:
+
+            log.warning(
+                "Токен истёк. Обновляю авторизацию."
+            )
+
+            self.refresh()
+
+            response = self.session.request(
                 method,
                 url,
-                timeout=60,
+                timeout=REQUEST_TIMEOUT,
                 **kwargs
             )
 
-            if r.status_code == 401 and attempt == 0:
-                self.refresh()
-                continue
+        if not response.ok:
 
-            if not r.ok:
-                log.error(
-                    "Cassandra HTTP %s: %s",
-                    r.status_code,
-                    r.text[:1500]
-                )
+            log.error(
+                "Cassandra HTTP %s: %s",
+                response.status_code,
+                response.text[:1500]
+            )
 
-            r.raise_for_status()
+        response.raise_for_status()
 
-            return r.json() if r.text.strip() else None
+        if not response.text.strip():
+            return None
 
-        raise RuntimeError(
-            "Не удалось выполнить запрос Cassandra"
-        )
+        return response.json()
 
-    def candles(self):
+    # --------------------------------------------------------
+    # Получение свечей по инструменту
+    # --------------------------------------------------------
+
+    def candles(self, security):
+
         now = int(time.time())
         day = 86400
 
-        # При первом запуске загружаем историю за 5 дней.
-        if not self._candles_loaded:
+        if security not in self.candles_cache:
+            self.candles_cache[security] = {}
 
-            log.info("Первичная загрузка истории за 5 дней")
+        cache = self.candles_cache[security]
+
+        # Первичная загрузка истории
+        if security not in self.candles_loaded:
+
+            log.info(
+                "[%s] Первичная загрузка истории за 5 дней",
+                security
+            )
 
             for i in range(5):
+
                 end_time = now - i * day
                 start_time = end_time - day
 
@@ -179,7 +296,7 @@ class Cassandra:
                     "GET",
                     "/Clusters/Candles/periodUnix",
                     params={
-                        "securityId": SECURITY,
+                        "securityId": security,
                         "timeFrame": str(TIMEFRAME),
                         "from": start_time,
                         "to": end_time
@@ -189,20 +306,25 @@ class Cassandra:
                 history = result.get("history", [])
 
                 for candle in history:
+
                     candle_time = int(candle["time"])
-                    self._candles_cache[candle_time] = candle
+                    cache[candle_time] = candle
 
-            self._candles_loaded = True
-            self._last_candles_refresh = now
+            self.candles_loaded.add(security)
 
-        # Обновляем историю раз в 30 секунд.
-        elif now - self._last_candles_refresh >= 30:
+            self.last_candles_refresh[security] = now
+
+        # Периодическое обновление
+        elif (
+            now - self.last_candles_refresh.get(security, 0)
+            >= CANDLE_REFRESH_SECONDS
+        ):
 
             result = self.request(
                 "GET",
                 "/Clusters/Candles/periodUnix",
                 params={
-                    "securityId": SECURITY,
+                    "securityId": security,
                     "timeFrame": str(TIMEFRAME),
                     "from": now - day,
                     "to": now
@@ -212,34 +334,40 @@ class Cassandra:
             history = result.get("history", [])
 
             for candle in history:
+
                 candle_time = int(candle["time"])
-                self._candles_cache[candle_time] = candle
+                cache[candle_time] = candle
 
-            self._last_candles_refresh = now
+            self.last_candles_refresh[security] = now
 
-        # Удаляем слишком старые свечи.
+        # Удаляем историю старше 7 дней
         cutoff = now - 7 * day
 
-        self._candles_cache = {
+        self.candles_cache[security] = {
             timestamp: candle
-            for timestamp, candle in self._candles_cache.items()
+            for timestamp, candle in cache.items()
             if timestamp >= cutoff
         }
 
         history = sorted(
-            self._candles_cache.values(),
+            self.candles_cache[security].values(),
             key=lambda candle: int(candle["time"])
         )
 
         log.info(
-            "Загружено исторических свечей: %s",
+            "[%s] Свечей загружено: %s",
+            security,
             len(history)
         )
 
         return {"history": history}
 
-    def market_order(self, side, volume):
-        # side 0 = BUY, side 1 = SELL
+    # --------------------------------------------------------
+    # Рыночная заявка
+    # --------------------------------------------------------
+
+    def market_order(self, security, side, volume):
+
         side_code = 0 if side == "BUY" else 1
 
         result = self.request(
@@ -247,19 +375,23 @@ class Cassandra:
             "/Order/market",
             json={
                 "tradeAccount": ACCOUNT,
-                "securityId": SECURITY,
+                "securityId": security,
                 "side": side_code,
                 "volume": volume
             }
         )
 
-        if isinstance(result, dict) and result.get("data") is False:
-            raise RuntimeError(
-                f"Заявка отклонена Cassandra: {result.get('message')}"
-            )
+        if isinstance(result, dict):
+
+            if result.get("data") is False:
+
+                raise RuntimeError(
+                    f"Заявка отклонена: {result.get('message')}"
+                )
 
         log.info(
-            "Заявка %s отправлена: %s лот(ов). Ответ: %s",
+            "[%s] Заявка %s отправлена: %s лот(ов). Ответ: %s",
+            security,
             side,
             volume,
             result
@@ -267,35 +399,200 @@ class Cassandra:
 
         return result
 
+    # --------------------------------------------------------
+    # Открытые позиции брокера
+    # --------------------------------------------------------
+
     def open_positions(self):
+
         return self.request(
             "GET",
             f"/api/Positions/open/{EMAIL}"
         )
 
 
-# ---------- СОСТОЯНИЕ БОТА ----------
-def load_state():
-    if STATE_FILE.exists():
-        with STATE_FILE.open("r", encoding="utf-8") as f:
-            return json.load(f)
+# ============================================================
+# РАЗБОР ОТВЕТА С ПОЗИЦИЯМИ
+# ============================================================
 
-    return {
-        "date": str(datetime.now(TZ).date()),
-        "position": None,
-        "last_candle": None,
-        "daily_loss": 0.0,
-        "trades": 0
-    }
+def extract_position_rows(response):
+
+    if response is None:
+        return []
+
+    if isinstance(response, list):
+        return response
+
+    if isinstance(response, dict):
+
+        for key in (
+            "positions",
+            "data",
+            "result",
+            "items"
+        ):
+
+            if key in response:
+
+                value = response[key]
+
+                if isinstance(value, list):
+                    return value
+
+                if isinstance(value, dict):
+
+                    return extract_position_rows(value)
+
+        # Возможно, API вернул одну позицию
+        if any(
+            key in response
+            for key in (
+                "securityId",
+                "security",
+                "ticker",
+                "instrument"
+            )
+        ):
+            return [response]
+
+        if not response:
+            return []
+
+    raise PositionSyncError(
+        "Неизвестный формат ответа Cassandra "
+        "со списком открытых позиций. "
+        "Торговля остановлена."
+    )
+
+
+def get_position_security(position):
+
+    possible_keys = (
+        "securityId",
+        "security",
+        "ticker",
+        "instrument",
+        "symbol",
+        "securityCode"
+    )
+
+    for key in possible_keys:
+
+        value = position.get(key)
+
+        if isinstance(value, str) and value:
+
+            value = value.upper()
+
+            if "@" not in value:
+                value += "@TQBR"
+
+            return value
+
+        if isinstance(value, dict):
+
+            for nested_key in (
+                "securityId",
+                "ticker",
+                "symbol",
+                "code"
+            ):
+
+                nested_value = value.get(nested_key)
+
+                if isinstance(nested_value, str):
+
+                    nested_value = nested_value.upper()
+
+                    if "@" not in nested_value:
+                        nested_value += "@TQBR"
+
+                    return nested_value
+
+    return None
+
+
+def get_broker_position_symbols(api):
+
+    response = api.open_positions()
+
+    rows = extract_position_rows(response)
+
+    symbols = set()
+
+    for position in rows:
+
+        security = get_position_security(position)
+
+        if security is None:
+
+            raise PositionSyncError(
+                "Не удалось определить инструмент "
+                "в открытой позиции Cassandra. "
+                "Проверь формат ответа API."
+            )
+
+        symbols.add(security)
+
+    return symbols
+
+
+# ============================================================
+# СОСТОЯНИЕ БОТА
+# ============================================================
+
+def load_state():
+
+    if STATE_FILE.exists():
+
+        with STATE_FILE.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+
+    else:
+
+        state = {}
+
+    today = str(datetime.now(TZ).date())
+
+    # Поддержка старого формата bot_state.json
+    old_position = state.pop("position", None)
+    old_last_candle = state.pop("last_candle", None)
+
+    positions = state.setdefault("positions", {})
+
+    if old_position is not None:
+
+        positions.setdefault(
+            "SBER@TQBR",
+            old_position
+        )
+
+    last_candles = state.setdefault("last_candles", {})
+
+    if old_last_candle is not None:
+
+        last_candles.setdefault(
+            "SBER@TQBR",
+            old_last_candle
+        )
+
+    state.setdefault("date", today)
+    state.setdefault("daily_loss", 0.0)
+    state.setdefault("trades", 0)
+    state.setdefault("pending_orders", {})
+
+    return state
 
 
 def save_state(state):
+
     temp = STATE_FILE.with_suffix(".tmp")
 
-    with temp.open("w", encoding="utf-8") as f:
+    with temp.open("w", encoding="utf-8") as file:
+
         json.dump(
             state,
-            f,
+            file,
             ensure_ascii=False,
             indent=2
         )
@@ -304,226 +601,643 @@ def save_state(state):
 
 
 def reset_daily_limits(state):
+
     today = str(datetime.now(TZ).date())
 
     if state["date"] != today:
+
         state["date"] = today
         state["daily_loss"] = 0.0
         state["trades"] = 0
 
         save_state(state)
 
-        log.info("Дневные счётчики сброшены")
+        log.info("Дневные ограничения сброшены")
 
 
-# ---------- РЫНОЧНОЕ ВРЕМЯ ----------
+# ============================================================
+# РЫНОЧНОЕ ВРЕМЯ
+# ============================================================
+
 def market_is_open():
+
     now = datetime.now(TZ)
 
     if now.weekday() >= 5:
         return False
 
-    current = now.time()
-
     return (
         clock_time(9, 50)
-        <= current
+        <= now.time()
         < clock_time(18, 45)
     )
 
 
-# ---------- ТОРГОВЫЙ ЦИКЛ ----------
-def run_bot():
-    api = Cassandra()
-    api.login()
+# ============================================================
+# АКТУАЛЬНОСТЬ ДАННЫХ
+# ============================================================
 
-    state = load_state()
-    reset_daily_limits(state)
+def check_candle_freshness(history):
 
-    # Проверяем, нет ли уже открытой позиции.
-    if state["position"] is None:
-        positions = api.open_positions()
+    if not history:
+        return False
 
-        if positions:
-            raise RuntimeError(
-                "Cassandra сообщает об открытых позициях. "
-                "Проверь их перед первым запуском; "
-                "бот остановлен ради защиты от повторной покупки."
-            )
+    latest = max(
+        history,
+        key=lambda candle: int(candle["time"])
+    )
 
-    # Не используем старый сигнал из истории при старте.
-    if state["last_candle"] is None:
-        data = api.candles()
-        history = data.get("history", [])
+    candle_time = int(latest["time"])
 
-        if history:
-            state["last_candle"] = int(history[-1]["time"])
-            save_state(state)
+    now_ts = int(time.time())
+
+    candle_age = now_ts - (candle_time + TIMEFRAME)
+
+    if not market_is_open():
+        return True
+
+    if candle_age > MAX_CANDLE_AGE:
+
+        log.warning(
+            "Рыночные данные устарели. "
+            "Возраст последней свечи: %s секунд",
+            candle_age
+        )
+
+        return False
+
+    return True
+
+
+# ============================================================
+# СВЕРКА ПОЗИЦИЙ
+# ============================================================
+
+def synchronize_positions(api, state):
+
+    if state["pending_orders"]:
+
+        raise OrderOutcomeUnknown(
+            "Есть незавершённые заявки в bot_state.json. "
+            "Проверь их в Cassandra вручную."
+        )
+
+    broker_symbols = get_broker_position_symbols(api)
+
+    local_symbols = set(state["positions"].keys())
+
+    if broker_symbols != local_symbols:
+
+        raise PositionSyncError(
+            "Расхождение позиций!\n"
+            f"В боте: {sorted(local_symbols)}\n"
+            f"В Cassandra: {sorted(broker_symbols)}\n"
+            "Проверь позиции вручную."
+        )
 
     log.info(
-        "Бот запущен. Инструмент: %s. Счёт: %s",
-        SECURITY,
+        "Сверка завершена. Открытых инструментов: %s",
+        len(broker_symbols)
+    )
+
+
+# ============================================================
+# ОТПРАВКА ЗАЯВКИ
+# ============================================================
+
+def execute_order(api, state, security, side, volume, price):
+
+    pending = {
+        "side": side,
+        "volume": volume,
+        "estimated_price": price,
+        "created_at": datetime.now(TZ).isoformat()
+    }
+
+    state["pending_orders"][security] = pending
+
+    save_state(state)
+
+    try:
+
+        api.market_order(
+            security,
+            side,
+            volume
+        )
+
+    except Exception as error:
+
+        raise OrderOutcomeUnknown(
+            f"[{security}] Неизвестен результат заявки {side}. "
+            "Не отправляй повторную заявку до проверки в Cassandra."
+        ) from error
+
+    try:
+
+        broker_symbols = get_broker_position_symbols(api)
+
+    except Exception as error:
+
+        raise OrderOutcomeUnknown(
+            f"[{security}] Заявка отправлена, "
+            "но не удалось проверить позиции."
+        ) from error
+
+    if side == "BUY" and security not in broker_symbols:
+
+        raise OrderOutcomeUnknown(
+            f"[{security}] BUY отправлен, "
+            "но позиция не обнаружена."
+        )
+
+    if side == "SELL" and security in broker_symbols:
+
+        raise OrderOutcomeUnknown(
+            f"[{security}] SELL отправлен, "
+            "но позиция всё ещё присутствует."
+        )
+
+    state["pending_orders"].pop(security, None)
+
+    save_state(state)
+
+
+# ============================================================
+# КОНТРОЛЬ ОТКРЫТОЙ ПОЗИЦИИ
+# ============================================================
+
+def manage_position(api, state, security, candle, price):
+
+    position = state["positions"].get(security)
+
+    if not position:
+        return
+
+    entry = float(position["entry"])
+    volume = int(position["volume"])
+
+    stop_price = entry * (1 - STOP_LOSS)
+    target_price = entry * (1 + TAKE_PROFIT)
+
+    low = float(candle["low"])
+    high = float(candle["high"])
+
+    exit_reason = None
+    exit_price = price
+
+    if low <= stop_price:
+
+        exit_reason = "STOP LOSS"
+        exit_price = stop_price
+
+    elif high >= target_price:
+
+        exit_reason = "TAKE PROFIT"
+        exit_price = target_price
+
+    now = datetime.now(TZ)
+
+    if (
+        now.weekday() < 5
+        and now.time() >= clock_time(18, 40)
+    ):
+
+        exit_reason = "END OF SESSION"
+        exit_price = price
+
+    if not exit_reason:
+        return
+
+    log.warning(
+        "[%s] %s. Вход: %.2f. Расчётная цена выхода: %.2f",
+        security,
+        exit_reason,
+        entry,
+        exit_price
+    )
+
+    execute_order(
+        api,
+        state,
+        security,
+        "SELL",
+        volume,
+        exit_price
+    )
+
+    shares = SHARES_PER_LOT[security]
+
+    pnl = (
+        exit_price - entry
+    ) * volume * shares
+
+    if pnl < 0:
+
+        state["daily_loss"] += abs(pnl)
+
+    state["positions"].pop(security, None)
+
+    save_state(state)
+
+    log.info(
+        "[%s] Позиция закрыта. "
+        "Расчётный результат: %.2f ₽",
+        security,
+        pnl
+    )
+
+
+# ============================================================
+# ОБРАБОТКА ОДНОГО ИНСТРУМЕНТА
+# ============================================================
+
+def process_security(api, state, security):
+
+    data = api.candles(security)
+
+    history = data.get("history", [])
+
+    if not history:
+
+        log.warning(
+            "[%s] Исторические свечи отсутствуют",
+            security
+        )
+
+        return
+
+    df = (
+        pd.DataFrame(history)
+        .sort_values("time")
+        .drop_duplicates(subset=["time"])
+        .reset_index(drop=True)
+    )
+
+    df["time"] = pd.to_numeric(
+        df["time"],
+        errors="coerce"
+    )
+
+    df = df.dropna(subset=["time"])
+
+    if df.empty:
+        return
+
+    now_ts = int(time.time())
+
+    closed = df[
+        df["time"] + TIMEFRAME <= now_ts
+    ]
+
+    if closed.empty:
+        return
+
+    last = closed.iloc[-1]
+
+    price = float(last["close"])
+    candle_time = int(last["time"])
+
+    # --------------------------------------------------------
+    # Управление открытой позицией
+    # --------------------------------------------------------
+
+    if security in state["positions"]:
+
+        if not check_candle_freshness(history):
+
+            log.warning(
+                "[%s] Контроль позиции пропущен: "
+                "данные устарели.",
+                security
+            )
+
+            return
+
+        manage_position(
+            api,
+            state,
+            security,
+            last,
+            price
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Проверки перед покупкой
+    # --------------------------------------------------------
+
+    if not market_is_open():
+        return
+
+    if candle_time == state["last_candles"].get(security):
+        return
+
+    if state["daily_loss"] >= DAILY_LOSS_LIMIT:
+
+        log.warning(
+            "Достигнут дневной лимит убытка. "
+            "Новые покупки запрещены."
+        )
+
+        return
+
+    if state["trades"] >= MAX_TRADES_PER_DAY:
+
+        log.info(
+            "Достигнут дневной лимит сделок."
+        )
+
+        return
+
+    if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+
+        log.info(
+            "Достигнут лимит одновременно открытых позиций."
+        )
+
+        return
+
+    if not check_candle_freshness(history):
+
+        log.warning(
+            "[%s] Покупка запрещена: данные устарели.",
+            security
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Стратегия №5 + RSI
+    # --------------------------------------------------------
+
+    signal_df = closed[
+        closed["time"] <= candle_time
+    ].copy()
+
+    signal = generate_signal(signal_df)
+
+    log.info(
+        "[%s] Новая свеча. Цена: %.2f. Сигнал: %s",
+        security,
+        price,
+        signal
+    )
+
+    # --------------------------------------------------------
+    # Покупка
+    # --------------------------------------------------------
+
+    if signal == "BUY":
+
+        volume = int(LOT_SIZE[security])
+
+        log.warning(
+            "[%s] Получен BUY. Отправляю заявку на %s лот(ов).",
+            security,
+            volume
+        )
+
+        execute_order(
+            api,
+            state,
+            security,
+            "BUY",
+            volume,
+            price
+        )
+
+        state["positions"][security] = {
+            "entry": price,
+            "volume": volume,
+            "opened_at": datetime.now(TZ).isoformat()
+        }
+
+        state["trades"] += 1
+
+        log.info(
+            "[%s] Позиция зарегистрирована. "
+            "Расчётная цена входа: %.2f",
+            security,
+            price
+        )
+
+    state["last_candles"][security] = candle_time
+
+    save_state(state)
+
+
+# ============================================================
+# ОСНОВНОЙ ЦИКЛ
+# ============================================================
+
+def run_bot():
+
+    api = Cassandra()
+
+    state = load_state()
+
+    reset_daily_limits(state)
+
+    # --------------------------------------------------------
+    # Начальная авторизация
+    # --------------------------------------------------------
+
+    attempt = 0
+
+    while True:
+
+        try:
+
+            api.login()
+            break
+
+        except requests.exceptions.RequestException:
+
+            delay = RECONNECT_DELAYS[
+                min(attempt, len(RECONNECT_DELAYS) - 1)
+            ]
+
+            log.exception(
+                "Нет соединения. Повтор через %s секунд.",
+                delay
+            )
+
+            time.sleep(delay)
+            attempt += 1
+
+    # --------------------------------------------------------
+    # Проверка незавершённых заявок и позиций
+    # --------------------------------------------------------
+
+    synchronize_positions(api, state)
+
+    log.info(
+        "Мультиинструментальный бот запущен."
+    )
+
+    log.info(
+        "Инструментов: %s",
+        len(SECURITIES)
+    )
+
+    log.info(
+        "Список инструментов: %s",
+        ", ".join(SECURITIES)
+    )
+
+    log.info(
+        "Счёт: %s",
         ACCOUNT
     )
 
+    reconnect_attempt = 0
+
+    # --------------------------------------------------------
+    # Основной цикл
+    # --------------------------------------------------------
+
     while True:
+
         try:
+
             reset_daily_limits(state)
 
-            data = api.candles()
-            history = data.get("history", [])
+            for security in SECURITIES:
 
-            if len(history) < 55:
-                log.warning(
-                    "Недостаточно свечей: %s",
-                    len(history)
-                )
-                time.sleep(POLL_SECONDS)
-                continue
-
-            df = (
-                pd.DataFrame(history)
-                .sort_values("time")
-                .reset_index(drop=True)
-            )
-
-            df["time"] = pd.to_numeric(df["time"])
-
-            now_ts = int(time.time())
-
-            # Последняя полностью закрытая 5-минутная свеча.
-            closed = df[
-                df["time"] + TIMEFRAME <= now_ts
-            ]
-
-            if closed.empty:
-                time.sleep(POLL_SECONDS)
-                continue
-
-            last = closed.iloc[-1]
-
-            price = float(last["close"])
-            candle_time = int(last["time"])
-
-            # ---------- КОНТРОЛЬ ПОЗИЦИИ ----------
-            position = state["position"]
-
-            if position:
-                entry = float(position["entry"])
-
-                stop_price = entry * (1 - STOP_LOSS)
-                target_price = entry * (1 + TAKE_PROFIT)
-
-                current_candle = df.iloc[-1]
-
-                low = float(current_candle["low"])
-                high = float(current_candle["high"])
-
-                exit_reason = None
-
-                if low <= stop_price:
-                    exit_reason = "STOP LOSS"
-
-                elif high >= target_price:
-                    exit_reason = "TAKE PROFIT"
-
-                # Не переносим позицию на ночь и выходные.
-                now = datetime.now(TZ)
-
-                if (
-                    now.weekday() < 5
-                    and now.time() >= clock_time(18, 40)
-                ):
-                    exit_reason = "END OF SESSION"
-
-                if exit_reason:
-                    log.info(
-                        "%s: цена %.2f, вход %.2f. Отправляю SELL",
-                        exit_reason,
-                        price,
-                        entry
-                    )
-
-                    api.market_order(
-                        "SELL",
-                        int(position["volume"])
-                    )
-
-                    pnl = (
-                        price - entry
-                    ) * int(position["volume"])
-
-                    if pnl < 0:
-                        state["daily_loss"] += abs(pnl)
-
-                    state["position"] = None
-                    save_state(state)
-
-                    log.info(
-                        "Позиция закрыта. Расчётный результат: %.2f ₽",
-                        pnl
-                    )
-
-            # ---------- ПОКУПКА ----------
-            if (
-                state["position"] is None
-                and candle_time != state["last_candle"]
-                and market_is_open()
-                and state["daily_loss"] < DAILY_LOSS_LIMIT
-                and state["trades"] < MAX_TRADES_PER_DAY
-            ):
-                signal_df = df[
-                    df["time"] <= candle_time
-                ].copy()
-
-                signal = generate_signal(signal_df)
-
-                log.info(
-                    "Новая свеча. Цена %.2f. Сигнал: %s",
-                    price,
-                    signal
+                process_security(
+                    api,
+                    state,
+                    security
                 )
 
-                if signal == "BUY":
-                    api.market_order("BUY", LOT_SIZE)
-
-                    state["position"] = {
-                        "entry": price,
-                        "volume": LOT_SIZE,
-                        "opened_at": datetime.now(TZ).isoformat()
-                    }
-
-                    state["trades"] += 1
-                    save_state(state)
-
-                    log.info(
-                        "BUY принят. Расчётная цена входа: %.2f",
-                        price
-                    )
-
-                state["last_candle"] = candle_time
-                save_state(state)
+            reconnect_attempt = 0
 
             time.sleep(POLL_SECONDS)
 
+        except OrderOutcomeUnknown:
+
+            log.exception(
+                "КРИТИЧЕСКАЯ ОШИБКА ЗАЯВКИ. "
+                "Бот остановлен."
+            )
+
+            raise
+
+        except PositionSyncError:
+
+            log.exception(
+                "ОШИБКА СИНХРОНИЗАЦИИ ПОЗИЦИЙ. "
+                "Бот остановлен."
+            )
+
+            raise
+
         except KeyboardInterrupt:
-            log.info("Остановка по команде пользователя")
+
+            log.info(
+                "Остановка по команде пользователя."
+            )
+
             break
 
-        except Exception:
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ):
+
+            delay = RECONNECT_DELAYS[
+                min(
+                    reconnect_attempt,
+                    len(RECONNECT_DELAYS) - 1
+                )
+            ]
+
             log.exception(
-                "Ошибка цикла. Повтор подключения через 30 секунд"
+                "Потеряно соединение. "
+                "Повтор через %s секунд.",
+                delay
+            )
+
+            time.sleep(delay)
+
+            try:
+
+                api.login()
+
+                synchronize_positions(
+                    api,
+                    state
+                )
+
+                reconnect_attempt = 0
+
+                log.info(
+                    "Соединение восстановлено. "
+                    "Позиции сверены."
+                )
+
+            except Exception:
+
+                log.exception(
+                    "Не удалось восстановить соединение."
+                )
+
+                reconnect_attempt += 1
+
+        except requests.exceptions.RequestException:
+
+            log.exception(
+                "Ошибка HTTP. Повтор через 30 секунд."
             )
 
             time.sleep(30)
 
             try:
+
                 api.login()
+
+                synchronize_positions(
+                    api,
+                    state
+                )
+
             except Exception:
+
                 log.exception(
-                    "Повторная авторизация не удалась"
+                    "Повторное подключение не удалось."
+                )
+
+        except Exception:
+
+            log.exception(
+                "Ошибка торгового цикла. "
+                "Повтор через 30 секунд."
+            )
+
+            time.sleep(30)
+
+            try:
+
+                api.login()
+
+                synchronize_positions(
+                    api,
+                    state
+                )
+
+            except Exception:
+
+                log.exception(
+                    "Не удалось восстановить работу бота."
                 )
 
 
+# ============================================================
+# ЗАПУСК
+# ============================================================
+
 if __name__ == "__main__":
+
     run_bot()
