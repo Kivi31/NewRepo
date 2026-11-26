@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
 from dotenv import load_dotenv
+from config import config
 
 from strategy import generate_signal
 
@@ -62,7 +63,7 @@ class Cassandra:
         r = self.session.post(
             LOGIN_URL + "/api/Authentication/Login",
             json={"email": EMAIL, "password": PASSWORD},
-            timeout=20
+            timeout=60
         )
         r.raise_for_status()
         data = r.json()
@@ -116,16 +117,17 @@ class Cassandra:
 
     def candles(self):
         now = int(time.time())
+
         return self.request(
             "GET",
             "/Clusters/Candles/periodUnix",
             params={
                 "securityId": SECURITY,
                 "timeFrame": str(TIMEFRAME),
-                "from": now - TIMEFRAME * 220,
+                "from": now - int(TIMEFRAME) * config.HISTORY_BARS,
                 "to": now
             }
-        )
+    )
 
     def market_order(self, side, volume):
         # side 0 = BUY, side 1 = SELL
