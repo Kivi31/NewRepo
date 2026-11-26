@@ -124,7 +124,7 @@ class Cassandra:
             params={
                 "securityId": SECURITY,
                 "timeFrame": str(TIMEFRAME),
-                "from": now - int(TIMEFRAME) * config.HISTORY_BARS,
+                "from": now - 86400 * 10,
                 "to": now
             }
     )
