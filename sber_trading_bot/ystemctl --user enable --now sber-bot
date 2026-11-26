@@ -1,0 +1,9 @@
+[0;1;32m●[0m sber-bot.service - SBER Automatic Trading Bot
+     Loaded: loaded (]8;;file://kk-b2.ufa.21-school.ru/home/harroldn/.config/systemd/user/sber-bot.service/home/harroldn/.config/systemd/user/sber-bot.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (running)[0m since Tue 2026-11-24 18:18:39 +05; 3min 50s ago
+   Main PID: 3434366 (python)
+      Tasks: 16 (limit: 37924)
+     Memory: 50.1M (peak: 50.6M)
+        CPU: 1.685s
+     CGroup: /user.slice/user-6104634.slice/user@6104634.service/app.slice/sber-bot.service
+             └─[0;38;5;245m3434366 /home/harroldn/hahaton/sber_trading_bot/venv/bin/python /home/harroldn/hahaton/sber_trading_bot/live_bot.py[0m
