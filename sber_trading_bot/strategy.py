@@ -1,32 +1,29 @@
-
-import pandas as pd
 import logging
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# СТРАТЕГИЯ №5: ORB + MA200 + RSI
+# ============================================================
 
-# Параметры стратегии №5
 ORB_START = "10:00"
 ORB_END = "10:30"
-ORB_BUFFER = 0.001       # 0.1%
+ORB_BUFFER = 0.001
+
 MA_PERIOD = 200
 RSI_PERIOD = 14
 RSI_MIN = 50
 RSI_MAX = 70
+
 TIMEZONE = "Europe/Moscow"
 
 
+# ============================================================
+# ИНДИКАТОРЫ
+# ============================================================
+
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ORB + MA200 + RSI(14).
-
-    Ожидаемые столбцы:
-    open, high, low, close, volume
-
-    Время свечи должно находиться в DatetimeIndex
-    или в одном из столбцов:
-    datetime, timestamp, time, date.
-    """
 
     required = {"open", "high", "low", "close", "volume"}
 
@@ -36,12 +33,17 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     data = df.copy()
 
-    # MA200 — направление глобального тренда
+    for column in ("open", "high", "low", "close", "volume"):
+        data[column] = pd.to_numeric(
+            data[column],
+            errors="coerce"
+        )
+
     data["ma200"] = data["close"].rolling(
-        window=MA_PERIOD
+        window=MA_PERIOD,
+        min_periods=MA_PERIOD
     ).mean()
 
-    # RSI(14)
     delta = data["close"].diff()
 
     gain = delta.clip(lower=0)
@@ -60,23 +62,27 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, float("nan"))
+
     data["rsi"] = 100 - (100 / (1 + rs))
 
-    # Если цена росла без снижения — RSI = 100
     data.loc[
-        (avg_loss == 0) & (avg_gain > 0), "rsi"
+        (avg_loss == 0) & (avg_gain > 0),
+        "rsi"
     ] = 100
 
-    # Если цена не менялась — RSI = 50
     data.loc[
-        (avg_loss == 0) & (avg_gain == 0), "rsi"
+        (avg_loss == 0) & (avg_gain == 0),
+        "rsi"
     ] = 50
 
     return data
 
 
+# ============================================================
+# ПРЕОБРАЗОВАНИЕ ВРЕМЕНИ В МОСКОВСКОЕ
+# ============================================================
+
 def _get_moscow_times(df: pd.DataFrame):
-    """Получает время свечей и приводит его к московскому часовому поясу."""
 
     time_column = None
 
@@ -86,120 +92,265 @@ def _get_moscow_times(df: pd.DataFrame):
             break
 
     if time_column is not None:
+
         raw = df[time_column]
 
         if pd.api.types.is_numeric_dtype(raw):
-            median = raw.dropna().abs().median()
+
+            valid = raw.dropna()
+
+            if valid.empty:
+                return None
+
+            median = valid.abs().median()
+
+            # ВАЖНО:
+            # Unix timestamp всегда отсчитывается от UTC.
+            # Сначала определяем UTC, затем переводим в Москву.
 
             if median > 1e14:
-                times = pd.to_datetime(raw, unit="ns", errors="coerce")
+
+                times = pd.to_datetime(
+                    raw,
+                    unit="ns",
+                    errors="coerce",
+                    utc=True
+                )
+
             elif median > 1e11:
-                times = pd.to_datetime(raw, unit="ms", errors="coerce")
+
+                times = pd.to_datetime(
+                    raw,
+                    unit="ms",
+                    errors="coerce",
+                    utc=True
+                )
+
             else:
-                times = pd.to_datetime(raw, unit="s", errors="coerce")
+
+                times = pd.to_datetime(
+                    raw,
+                    unit="s",
+                    errors="coerce",
+                    utc=True
+                )
+
         else:
-            times = pd.to_datetime(raw, errors="coerce")
+
+            times = pd.to_datetime(
+                raw,
+                errors="coerce"
+            )
 
     elif isinstance(df.index, pd.DatetimeIndex):
-        times = pd.Series(df.index, index=df.index)
+
+        times = pd.DatetimeIndex(df.index)
 
     else:
+
         return None
 
     times = pd.DatetimeIndex(times)
 
     if times.tz is None:
-        times = times.tz_localize(TIMEZONE)
+
+        # Для строковых дат без часового пояса
+        # предполагаем, что они уже московские.
+
+        times = times.tz_localize(
+            TIMEZONE,
+            ambiguous="NaT",
+            nonexistent="NaT"
+        )
+
     else:
+
         times = times.tz_convert(TIMEZONE)
 
     return times
 
 
+# ============================================================
+# ГЕНЕРАЦИЯ СИГНАЛА
+# ============================================================
+
 def generate_signal(df: pd.DataFrame) -> str:
-    """ORB + MA200 + RSI с диагностикой."""
 
-    if len(df) < MA_PERIOD:
+    if df is None or df.empty:
+
+        logger.warning("HOLD | Нет данных для анализа")
+        return "HOLD"
+
+    if len(df) < MA_PERIOD + 1:
+
         logger.info(
-            "HOLD | Недостаточно свечей: %s из %s",
-            len(df), MA_PERIOD
+            "HOLD | Недостаточно свечей: %s. Требуется минимум %s",
+            len(df),
+            MA_PERIOD + 1
         )
+
         return "HOLD"
 
-    data = calculate_indicators(df)
-    times = _get_moscow_times(data)
+    try:
 
-    if times is None:
-        logger.warning("HOLD | Не удалось определить время свечей")
-        return "HOLD"
+        data = calculate_indicators(df)
 
-    data = data.copy()
-    data["_time"] = times
+        times = _get_moscow_times(data)
 
-    current = data.iloc[-1]
-    previous = data.iloc[-2]
+        if times is None:
 
-    if pd.isna(current["ma200"]) or pd.isna(current["rsi"]):
-        logger.info("HOLD | MA200 или RSI ещё не рассчитаны")
-        return "HOLD"
+            logger.warning(
+                "HOLD | Не удалось определить время свечей"
+            )
 
-    current_time = current["_time"]
+            return "HOLD"
 
-    if current_time.strftime("%H:%M") < ORB_END:
-        logger.info("HOLD | ORB ещё формируется")
-        return "HOLD"
+        data = data.copy()
+        data["_time"] = times
 
-    today = current_time.date()
+        data = data.dropna(subset=["_time"])
 
-    day_mask = data["_time"].apply(
-        lambda t: t.date() == today
-    )
+        if len(data) < MA_PERIOD + 1:
 
-    day_data = data.loc[day_mask]
+            logger.info(
+                "HOLD | Недостаточно корректных свечей"
+            )
 
-    orb_data = day_data[
-        (day_data["_time"].dt.strftime("%H:%M") >= ORB_START)
-        & (day_data["_time"].dt.strftime("%H:%M") < ORB_END)
-    ]
+            return "HOLD"
 
-    if len(orb_data) < 6:
+        current = data.iloc[-1]
+        previous = data.iloc[-2]
+
+        if (
+            pd.isna(current["ma200"])
+            or pd.isna(current["rsi"])
+        ):
+
+            logger.info(
+                "HOLD | MA200 или RSI ещё не рассчитаны"
+            )
+
+            return "HOLD"
+
+        current_time = current["_time"]
+
+        # ORB ещё не сформирован
+        if current_time.strftime("%H:%M") < ORB_END:
+
+            logger.info(
+                "HOLD | ORB ещё формируется. Время свечи: %s",
+                current_time.strftime("%H:%M")
+            )
+
+            return "HOLD"
+
+        today = current_time.date()
+
+        # Свечи только за текущий московский день
+        day_mask = data["_time"].apply(
+            lambda t: t.date() == today
+        )
+
+        day_data = data.loc[day_mask]
+
+        # ORB: с 10:00 включительно до 10:30
+        orb_data = day_data[
+            (
+                day_data["_time"].dt.strftime("%H:%M")
+                >= ORB_START
+            )
+            &
+            (
+                day_data["_time"].dt.strftime("%H:%M")
+                < ORB_END
+            )
+        ]
+
+        if len(orb_data) < 6:
+
+            logger.info(
+                "HOLD | Недостаточно свечей ORB: %s из 6. "
+                "Дата: %s",
+                len(orb_data),
+                today
+            )
+
+            return "HOLD"
+
+        orb_high = float(orb_data["high"].max())
+
+        breakout_level = orb_high * (1 + ORB_BUFFER)
+
+        current_close = float(current["close"])
+        previous_close = float(previous["close"])
+
+        ma200 = float(current["ma200"])
+        rsi = float(current["rsi"])
+
+        # Условие пробоя:
+        # предыдущая свеча закрылась не выше уровня,
+        # текущая закрылась выше уровня.
+
+        breakout = (
+            previous_close <= breakout_level
+            and current_close > breakout_level
+        )
+
+        trend_confirmed = current_close > ma200
+
+        rsi_confirmed = RSI_MIN <= rsi <= RSI_MAX
+
         logger.info(
-            "HOLD | Недостаточно свечей ORB: %s из 6",
-            len(orb_data)
+            "Проверка стратегии | "
+            "Дата: %s | Время: %s | "
+            "Цена: %.2f | ORB High: %.2f | "
+            "Уровень пробоя: %.2f | "
+            "MA200: %.2f | RSI: %.2f | "
+            "Пробой: %s | Тренд: %s | RSI-фильтр: %s",
+            today,
+            current_time.strftime("%H:%M"),
+            current_close,
+            orb_high,
+            breakout_level,
+            ma200,
+            rsi,
+            breakout,
+            trend_confirmed,
+            rsi_confirmed
         )
+
+        if breakout and trend_confirmed and rsi_confirmed:
+
+            logger.info(
+                "BUY | Все условия стратегии выполнены"
+            )
+
+            return "BUY"
+
+        reasons = []
+
+        if not breakout:
+            reasons.append("нет нового пробоя ORB")
+
+        if not trend_confirmed:
+            reasons.append("цена ниже MA200")
+
+        if not rsi_confirmed:
+            reasons.append(
+                f"RSI вне диапазона {RSI_MIN}-{RSI_MAX}"
+            )
+
+        logger.info(
+            "HOLD | Причины: %s",
+            "; ".join(reasons)
+        )
+
         return "HOLD"
 
-    orb_high = orb_data["high"].max()
-    breakout_level = orb_high * (1 + ORB_BUFFER)
+    except Exception:
 
-    breakout = (
-        previous["close"] <= breakout_level
-        and current["close"] > breakout_level
-    )
+        logger.exception(
+            "Ошибка при расчёте торгового сигнала"
+        )
 
-    trend_confirmed = current["close"] > current["ma200"]
-
-    rsi_confirmed = (
-        RSI_MIN <= current["rsi"] <= RSI_MAX
-    )
-
-    logger.info(
-        "Проверка стратегии | "
-        "Цена: %.2f | ORB High: %.2f | Уровень пробоя: %.2f | "
-        "MA200: %.2f | RSI: %.2f | "
-        "Пробой: %s | Тренд: %s | RSI-фильтр: %s",
-        current["close"],
-        orb_high,
-        breakout_level,
-        current["ma200"],
-        current["rsi"],
-        breakout,
-        trend_confirmed,
-        rsi_confirmed
-    )
-
-    if breakout and trend_confirmed and rsi_confirmed:
-        logger.info("BUY | Все условия стратегии выполнены")
-        return "BUY"
-
-    return "HOLD"
+        return "HOLD"

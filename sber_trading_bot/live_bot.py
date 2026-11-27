@@ -852,180 +852,122 @@ def manage_position(api, state, security, candle, price):
 # ОБРАБОТКА ОДНОГО ИНСТРУМЕНТА
 # ============================================================
 
+
 def process_security(api, state, security):
+    try:
+        data = api.candles(security)
+        history = data.get("history", [])
 
-    data = api.candles(security)
-
-    history = data.get("history", [])
-
-    if not history:
-
-        log.warning(
-            "[%s] Исторические свечи отсутствуют",
-            security
-        )
-
-        return
-
-    df = (
-        pd.DataFrame(history)
-        .sort_values("time")
-        .drop_duplicates(subset=["time"])
-        .reset_index(drop=True)
-    )
-
-    df["time"] = pd.to_numeric(
-        df["time"],
-        errors="coerce"
-    )
-
-    df = df.dropna(subset=["time"])
-
-    if df.empty:
-        return
-
-    now_ts = int(time.time())
-
-    closed = df[
-        df["time"] + TIMEFRAME <= now_ts
-    ]
-
-    if closed.empty:
-        return
-
-    last = closed.iloc[-1]
-
-    price = float(last["close"])
-    candle_time = int(last["time"])
-
-    # --------------------------------------------------------
-    # Управление открытой позицией
-    # --------------------------------------------------------
-
-    if security in state["positions"]:
-
-        if not check_candle_freshness(history):
-
-            log.warning(
-                "[%s] Контроль позиции пропущен: "
-                "данные устарели.",
-                security
-            )
-
+        if not history:
+            log.warning("[%s] ПРОПУСК: API вернул пустую историю", security)
             return
 
-        manage_position(
-            api,
-            state,
-            security,
-            last,
-            price
-        )
+        df = pd.DataFrame(history)
 
-        return
+        if "time" not in df.columns or "close" not in df.columns:
+            log.error("[%s] ПРОПУСК: в свечах нет time или close. Колонки: %s",
+                      security, list(df.columns))
+            return
 
-    # --------------------------------------------------------
-    # Проверки перед покупкой
-    # --------------------------------------------------------
+        df["time"] = pd.to_numeric(df["time"], errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.dropna(subset=["time", "close"])
+        df = df.sort_values("time").drop_duplicates(
+            subset=["time"]
+        ).reset_index(drop=True)
 
-    if not market_is_open():
-        return
+        if df.empty:
+            log.warning("[%s] ПРОПУСК: после обработки свечей датафрейм пуст",
+                        security)
+            return
 
-    if candle_time == state["last_candles"].get(security):
-        return
+        now_ts = int(time.time())
+        closed = df[df["time"] + TIMEFRAME <= now_ts]
 
-    if state["daily_loss"] >= DAILY_LOSS_LIMIT:
+        if closed.empty:
+            log.warning(
+                "[%s] ПРОПУСК: нет закрытых свечей. "
+                "Последнее время=%s, now=%s",
+                security, int(df.iloc[-1]["time"]), now_ts
+            )
+            return
 
-        log.warning(
-            "Достигнут дневной лимит убытка. "
-            "Новые покупки запрещены."
-        )
+        last = closed.iloc[-1]
+        price = float(last["close"])
+        candle_time = int(last["time"])
 
-        return
+        if security in state["positions"]:
+            if not check_candle_freshness(history):
+                log.warning("[%s] ПРОПУСК: устаревшие данные для позиции",
+                            security)
+                return
 
-    if state["trades"] >= MAX_TRADES_PER_DAY:
+            manage_position(api, state, security, last, price)
+            return
 
-        log.info(
-            "Достигнут дневной лимит сделок."
-        )
+        if not market_is_open():
+            log.info("[%s] ПРОПУСК: сейчас вне торгового времени", security)
+            return
 
-        return
+        if candle_time == state["last_candles"].get(security):
+            return
 
-    if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+        if state["daily_loss"] >= DAILY_LOSS_LIMIT:
+            log.warning("[%s] ПРОПУСК: достигнут дневной лимит убытка",
+                        security)
+            return
 
-        log.info(
-            "Достигнут лимит одновременно открытых позиций."
-        )
+        if state["trades"] >= MAX_TRADES_PER_DAY:
+            log.info("[%s] ПРОПУСК: достигнут лимит сделок", security)
+            return
 
-        return
+        if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+            log.info("[%s] ПРОПУСК: достигнут лимит открытых позиций",
+                     security)
+            return
 
-    if not check_candle_freshness(history):
+        if not check_candle_freshness(history):
+            log.warning("[%s] ПРОПУСК: последняя свеча устарела", security)
+            return
 
-        log.warning(
-            "[%s] Покупка запрещена: данные устарели.",
-            security
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Стратегия №5 + RSI
-    # --------------------------------------------------------
-
-    signal_df = closed[
-        closed["time"] <= candle_time
-    ].copy()
-
-    signal = generate_signal(signal_df)
-
-    log.info(
-        "[%s] Новая свеча. Цена: %.2f. Сигнал: %s",
-        security,
-        price,
-        signal
-    )
-
-    # --------------------------------------------------------
-    # Покупка
-    # --------------------------------------------------------
-
-    if signal == "BUY":
-
-        volume = int(LOT_SIZE[security])
-
-        log.warning(
-            "[%s] Получен BUY. Отправляю заявку на %s лот(ов).",
-            security,
-            volume
-        )
-
-        execute_order(
-            api,
-            state,
-            security,
-            "BUY",
-            volume,
-            price
-        )
-
-        state["positions"][security] = {
-            "entry": price,
-            "volume": volume,
-            "opened_at": datetime.now(TZ).isoformat()
-        }
-
-        state["trades"] += 1
+        signal_df = closed[closed["time"] <= candle_time].copy()
+        signal = generate_signal(signal_df)
 
         log.info(
-            "[%s] Позиция зарегистрирована. "
-            "Расчётная цена входа: %.2f",
-            security,
-            price
+            "[%s] НОВАЯ СВЕЧА: цена=%.2f, время=%s, свечей=%s, сигнал=%s",
+            security, price, candle_time, len(signal_df), signal
         )
 
-    state["last_candles"][security] = candle_time
+        if signal == "BUY":
+            volume = int(LOT_SIZE[security])
 
-    save_state(state)
+            log.warning(
+                "[%s] BUY: отправка заявки. Объём=%s",
+                security, volume
+            )
+
+            execute_order(api, state, security, "BUY", volume, price)
+
+            state["positions"][security] = {
+                "entry": price,
+                "volume": volume,
+                "opened_at": datetime.now(TZ).isoformat()
+            }
+            state["trades"] += 1
+
+            log.info(
+                "[%s] Позиция зарегистрирована. Цена расчётная: %.2f",
+                security, price
+            )
+
+        state["last_candles"][security] = candle_time
+        save_state(state)
+
+    except OrderOutcomeUnknown:
+        raise
+    except Exception:
+        log.exception("[%s] ОШИБКА обработки инструмента", security)
+        raise
 
 
 # ============================================================

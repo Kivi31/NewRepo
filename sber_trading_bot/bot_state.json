@@ -1,8 +1,20 @@
 {
-  "date": "2026-11-26",
-  "position": null,
-  "last_candle": 1795707300,
+  "date": "2026-11-27",
   "daily_loss": 0.0,
   "trades": 0,
-  "pending_order": null
+  "pending_order": null,
+  "positions": {},
+  "last_candles": {
+    "SBER@TQBR": 1795779000,
+    "GAZP@TQBR": 1795779000,
+    "LKOH@TQBR": 1795779000,
+    "YDEX@TQBR": 1795779000,
+    "T@TQBR": 1795779000,
+    "VTBR@TQBR": 1795779000,
+    "CHMF@TQBR": 1795779000,
+    "NVTK@TQBR": 1795779000,
+    "GMKN@TQBR": 1795779000,
+    "ROSN@TQBR": 1795779000
+  },
+  "pending_orders": {}
 }
